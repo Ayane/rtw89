@@ -66,7 +66,11 @@ static int rtw89_ops_start(struct ieee80211_hw *hw)
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void rtw89_ops_stop(struct ieee80211_hw *hw, bool suspend)
+#else
 static void rtw89_ops_stop(struct ieee80211_hw *hw)
+#endif
 {
 	struct rtw89_dev *rtwdev = hw->priv;
 
@@ -898,26 +902,8 @@ static void rtw89_ops_reconfig_complete(struct ieee80211_hw *hw,
 static int rtw89_ops_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			     struct ieee80211_scan_request *req)
 {
-	struct rtw89_dev *rtwdev = hw->priv;
-	struct rtw89_vif *rtwvif = vif_to_rtwvif_safe(vif);
-	int ret = 0;
-
-	if (!RTW89_CHK_FW_FEATURE(SCAN_OFFLOAD, &rtwdev->fw))
-		return 1;
-
-	if (rtwdev->scanning || rtwvif->offchan)
-		return -EBUSY;
-
-	mutex_lock(&rtwdev->mutex);
-	rtw89_hw_scan_start(rtwdev, vif, req);
-	ret = rtw89_hw_scan_offload(rtwdev, vif, true);
-	if (ret) {
-		rtw89_hw_scan_abort(rtwdev, vif);
-		rtw89_err(rtwdev, "HW scan failed with status: %d\n", ret);
-	}
-	mutex_unlock(&rtwdev->mutex);
-
-	return ret;
+	/* Firmware scan offload can leave P2P discovery scans stuck forever. */
+	return 1;
 }
 
 static void rtw89_ops_cancel_hw_scan(struct ieee80211_hw *hw,

@@ -5470,6 +5470,7 @@ struct rtw89_dev {
 	struct rtw89_ppdu_sts_info ppdu_sts;
 	u8 total_sta_assoc;
 	bool scanning;
+	bool p2p_no_cck_scan;
 
 	struct rtw89_regulatory_info regulatory;
 	struct rtw89_sar_info sar;

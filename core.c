@@ -36,6 +36,9 @@ MODULE_PARM_DESC(disable_ps_mode, "Set Y to disable low power mode");
 #define RTW89_DEF_CHAN_6G(_freq, _hw_val)	\
 	RTW89_DEF_CHAN(_freq, _hw_val, 0, NL80211_BAND_6GHZ)
 
+#define RTW89_WLAN_OUI_TYPE_WFA_WFD 0x0a
+#define RTW89_RRSR_OFDM_EN 2
+
 static struct ieee80211_channel rtw89_channels_2ghz[] = {
 	RTW89_DEF_CHAN_2G(2412, 1),
 	RTW89_DEF_CHAN_2G(2417, 2),
@@ -174,6 +177,10 @@ static const struct ieee80211_iface_limit rtw89_iface_limits[] = {
 			 BIT(NL80211_IFTYPE_P2P_GO) |
 			 BIT(NL80211_IFTYPE_AP),
 	},
+	{
+		.max = 1,
+		.types = BIT(NL80211_IFTYPE_P2P_DEVICE),
+	},
 };
 
 static const struct ieee80211_iface_limit rtw89_iface_limits_mcc[] = {
@@ -186,19 +193,23 @@ static const struct ieee80211_iface_limit rtw89_iface_limits_mcc[] = {
 		.types = BIT(NL80211_IFTYPE_P2P_CLIENT) |
 			 BIT(NL80211_IFTYPE_P2P_GO),
 	},
+	{
+		.max = 1,
+		.types = BIT(NL80211_IFTYPE_P2P_DEVICE),
+	},
 };
 
 static const struct ieee80211_iface_combination rtw89_iface_combs[] = {
 	{
 		.limits = rtw89_iface_limits,
 		.n_limits = ARRAY_SIZE(rtw89_iface_limits),
-		.max_interfaces = 2,
+		.max_interfaces = 3,
 		.num_different_channels = 1,
 	},
 	{
 		.limits = rtw89_iface_limits_mcc,
 		.n_limits = ARRAY_SIZE(rtw89_iface_limits_mcc),
-		.max_interfaces = 2,
+		.max_interfaces = 3,
 		.num_different_channels = 2,
 	},
 };
@@ -586,17 +597,44 @@ rtw89_core_tx_update_sec_key(struct rtw89_dev *rtwdev,
 	desc_info->wp_offset = 1; /* in unit of 8 bytes for security header */
 }
 
+static bool rtw89_core_tx_mgmt_has_p2p_wfd_ie(struct sk_buff *skb)
+{
+	struct ieee80211_hdr *hdr = (void *)skb->data;
+	size_t hdr_len;
+	const u8 *ies;
+	size_t ies_len;
+
+	if (skb->len < sizeof(*hdr))
+		return false;
+
+	if (!ieee80211_is_mgmt(hdr->frame_control))
+		return false;
+
+	hdr_len = ieee80211_hdrlen(hdr->frame_control);
+	if (skb->len <= hdr_len)
+		return false;
+
+	ies = skb->data + hdr_len;
+	ies_len = skb->len - hdr_len;
+
+	return cfg80211_find_vendor_ie(WLAN_OUI_WFA, WLAN_OUI_TYPE_WFA_P2P,
+				       ies, ies_len) ||
+	       cfg80211_find_vendor_ie(WLAN_OUI_WFA, RTW89_WLAN_OUI_TYPE_WFA_WFD,
+				       ies, ies_len);
+}
+
 static u16 rtw89_core_get_mgmt_rate(struct rtw89_dev *rtwdev,
 				    struct rtw89_core_tx_request *tx_req,
 				    const struct rtw89_chan *chan)
 {
 	struct sk_buff *skb = tx_req->skb;
 	struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
-	struct ieee80211_vif *vif = tx_info->control.vif;
+	struct ieee80211_vif *vif = tx_info->control.vif ?: tx_req->vif;
 	u16 lowest_rate;
 
 	if (tx_info->flags & IEEE80211_TX_CTL_NO_CCK_RATE ||
-	    (vif && vif->p2p))
+	    (vif && (vif->p2p || vif->type == NL80211_IFTYPE_P2P_DEVICE)) ||
+	    rtw89_core_tx_mgmt_has_p2p_wfd_ie(skb))
 		lowest_rate = RTW89_HW_RATE_OFDM6;
 	else if (chan->band_type == RTW89_BAND_2G)
 		lowest_rate = RTW89_HW_RATE_CCK1;
@@ -650,6 +688,7 @@ rtw89_core_tx_update_mgmt_info(struct rtw89_dev *rtwdev,
 	desc_info->use_rate = true;
 	desc_info->dis_data_fb = true;
 	desc_info->data_rate = rtw89_core_get_mgmt_rate(rtwdev, tx_req, chan);
+	desc_info->data_retry_lowest_rate = desc_info->data_rate;
 
 	rtw89_debug(rtwdev, RTW89_DBG_TXRX,
 		    "tx mgmt frame with rate 0x%x on channel %d (band %d, bw %d)\n",
@@ -802,7 +841,7 @@ static u16 rtw89_core_get_data_rate(struct rtw89_dev *rtwdev,
 	if (rate_pattern->enable)
 		return rate_pattern->rate;
 
-	if (vif->p2p)
+	if (vif->p2p || vif->type == NL80211_IFTYPE_P2P_DEVICE)
 		lowest_rate = RTW89_HW_RATE_OFDM6;
 	else if (chan->band_type == RTW89_BAND_2G)
 		lowest_rate = RTW89_HW_RATE_CCK1;
@@ -3383,6 +3422,9 @@ void rtw89_vif_type_mapping(struct ieee80211_vif *vif, bool assoc)
 		else
 			rtwvif->wifi_role = RTW89_WIFI_ROLE_AP;
 		break;
+	case NL80211_IFTYPE_P2P_DEVICE:
+		rtwvif->wifi_role = RTW89_WIFI_ROLE_P2P_DEVICE;
+		break;
 	RTW89_TYPE_MAPPING(ADHOC);
 	RTW89_TYPE_MAPPING(MONITOR);
 	RTW89_TYPE_MAPPING(MESH_POINT);
@@ -3409,6 +3451,11 @@ void rtw89_vif_type_mapping(struct ieee80211_vif *vif, bool assoc)
 			rtwvif->net_type = RTW89_NET_TYPE_NO_LINK;
 			rtwvif->trigger = false;
 		}
+		rtwvif->self_role = RTW89_SELF_ROLE_CLIENT;
+		rtwvif->addr_cam.sec_ent_mode = RTW89_ADDR_CAM_SEC_NORMAL;
+		break;
+	case NL80211_IFTYPE_P2P_DEVICE:
+		rtwvif->net_type = RTW89_NET_TYPE_NO_LINK;
 		rtwvif->self_role = RTW89_SELF_ROLE_CLIENT;
 		rtwvif->addr_cam.sec_ent_mode = RTW89_ADDR_CAM_SEC_NORMAL;
 		break;
@@ -4414,6 +4461,47 @@ int rtw89_core_init(struct rtw89_dev *rtwdev)
 }
 EXPORT_SYMBOL(rtw89_core_init);
 
+static void rtw89_core_p2p_scan_no_cck(struct rtw89_dev *rtwdev,
+				       struct rtw89_vif *rtwvif, bool enable)
+{
+	u32 rate_en;
+	u32 reg;
+
+	if (rtwvif->wifi_role != RTW89_WIFI_ROLE_P2P_DEVICE)
+		return;
+
+	switch (rtwdev->chip->chip_id) {
+	case RTL8852A:
+	case RTL8852B:
+	case RTL8851B:
+		break;
+	default:
+		return;
+	}
+
+	rtwdev->p2p_no_cck_scan = enable;
+
+	if (enable && rtwdev->chip->chip_id == RTL8852B) {
+		reg = rtw89_mac_reg_by_idx(rtwdev, R_AX_TXRATE_CHK, rtwvif->mac_idx);
+		rtw89_write16_mask(rtwdev, reg, B_AX_DEFT_RATE_MASK,
+				   RTW89_HW_RATE_OFDM6);
+		rtw89_write8_set(rtwdev, reg,
+				 B_AX_CHECK_CCK_EN | B_AX_RTS_LIMIT_IN_OFDM6);
+
+		rtw89_phy_write32_mask(rtwdev, R_UPD_CLK_ADC, B_ENABLE_CCK, 0);
+		rtw89_phy_write32_mask(rtwdev, R_RXCCA, B_RXCCA_DIS, 1);
+		rtw89_debug(rtwdev, RTW89_DBG_TXRX,
+			    "P2P scan disables CCK MAC/PHY immediately\n");
+	}
+
+	rate_en = enable ? RTW89_RRSR_OFDM_EN : RRSR_OFDM_CCK_EN;
+	reg = rtw89_mac_reg_by_idx(rtwdev, R_AX_PTCL_RRSR1, rtwvif->mac_idx);
+	rtw89_write32_mask(rtwdev, reg, B_AX_RRSR_RATE_EN_MASK, rate_en);
+
+	rtw89_debug(rtwdev, RTW89_DBG_TXRX, "P2P scan %s CCK TX rates\n",
+		    enable ? "disables" : "restores");
+}
+
 void rtw89_core_deinit(struct rtw89_dev *rtwdev)
 {
 	rtw89_ser_deinit(rtwdev);
@@ -4433,6 +4521,7 @@ void rtw89_core_scan_start(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif,
 						       rtwvif->sub_entity_idx);
 
 	rtwdev->scanning = true;
+	rtw89_core_p2p_scan_no_cck(rtwdev, rtwvif, true);
 	rtw89_leave_lps(rtwdev);
 	if (hw_scan)
 		rtw89_leave_ips_by_hwflags(rtwdev);
@@ -4460,6 +4549,7 @@ void rtw89_core_scan_complete(struct rtw89_dev *rtwdev,
 	rtw89_chip_rfk_scan(rtwdev, false);
 	rtw89_btc_ntfy_scan_finish(rtwdev, RTW89_PHY_0);
 	rtw89_phy_config_edcca(rtwdev, false);
+	rtw89_core_p2p_scan_no_cck(rtwdev, rtwvif, false);
 
 	rtwdev->scanning = false;
 	rtwdev->dig.bypass_dig = true;
@@ -4651,6 +4741,7 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
 
 	hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
 				     BIT(NL80211_IFTYPE_AP) |
+				     BIT(NL80211_IFTYPE_P2P_DEVICE) |
 				     BIT(NL80211_IFTYPE_P2P_CLIENT) |
 				     BIT(NL80211_IFTYPE_P2P_GO);
 
