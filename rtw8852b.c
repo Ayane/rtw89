@@ -2621,7 +2621,7 @@ const struct rtw89_chip_info rtw8852b_chip_info = {
 	.dig_table		= NULL,
 	.dig_regs		= &rtw8852b_dig_regs,
 	.tssi_dbw_table		= NULL,
-	.support_chanctx_num	= 0,
+	.support_chanctx_num	= 2,
 	.support_rnr		= false,
 	.support_bands		= BIT(NL80211_BAND_2GHZ) |
 				  BIT(NL80211_BAND_5GHZ),

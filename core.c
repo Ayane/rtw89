@@ -25,6 +25,18 @@ static bool rtw89_disable_ps_mode;
 module_param_named(disable_ps_mode, rtw89_disable_ps_mode, bool, 0644);
 MODULE_PARM_DESC(disable_ps_mode, "Set Y to disable low power mode");
 
+static bool rtw89_force_8852b_chanctx = true;
+module_param_named(force_8852b_chanctx, rtw89_force_8852b_chanctx, bool, 0644);
+MODULE_PARM_DESC(force_8852b_chanctx, "Set N to disable experimental RTL8852B channel contexts");
+
+static bool rtw89_disable_8852b_roc;
+module_param_named(disable_8852b_roc, rtw89_disable_8852b_roc, bool, 0644);
+MODULE_PARM_DESC(disable_8852b_roc, "Set Y to disable experimental RTL8852B remain-on-channel ops");
+
+static bool rtw89_disable_p2p_no_cck = true;
+module_param_named(disable_p2p_no_cck, rtw89_disable_p2p_no_cck, bool, 0644);
+MODULE_PARM_DESC(disable_p2p_no_cck, "Set Y to keep CCK enabled during P2P/WFD discovery");
+
 #define RTW89_DEF_CHAN(_freq, _hw_val, _flags, _band)	\
 	{ .center_freq = _freq, .hw_value = _hw_val, .flags = _flags, .band = _band, }
 #define RTW89_DEF_CHAN_2G(_freq, _hw_val)	\
@@ -38,6 +50,9 @@ MODULE_PARM_DESC(disable_ps_mode, "Set Y to disable low power mode");
 
 #define RTW89_WLAN_OUI_TYPE_WFA_WFD 0x0a
 #define RTW89_RRSR_OFDM_EN 2
+
+static void rtw89_core_p2p_scan_no_cck(struct rtw89_dev *rtwdev,
+				       struct rtw89_vif *rtwvif, bool enable);
 
 static struct ieee80211_channel rtw89_channels_2ghz[] = {
 	RTW89_DEF_CHAN_2G(2412, 1),
@@ -3048,9 +3063,17 @@ void rtw89_roc_start(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 	struct rtw89_roc *roc = &rtwvif->roc;
 	struct cfg80211_chan_def roc_chan;
 	struct rtw89_vif *tmp;
+	bool p2p_roc;
 	int ret;
 
 	lockdep_assert_held(&rtwdev->mutex);
+
+	p2p_roc = rtwvif->wifi_role == RTW89_WIFI_ROLE_P2P_DEVICE;
+
+	rtw89_debug(rtwdev, RTW89_DBG_CHAN,
+		    "ROC start: role=%d p2p=%d sub=%d freq=%d dur=%d type=%d\n",
+		    rtwvif->wifi_role, p2p_roc, rtwvif->sub_entity_idx,
+		    roc->chan.center_freq, roc->duration, roc->type);
 
 	rtw89_leave_ips_by_hwflags(rtwdev);
 	rtw89_leave_lps(rtwdev);
@@ -3068,6 +3091,16 @@ void rtw89_roc_start(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 	cfg80211_chandef_create(&roc_chan, &roc->chan, NL80211_CHAN_NO_HT);
 	rtw89_config_roc_chandef(rtwdev, rtwvif->sub_entity_idx, &roc_chan);
 	rtw89_set_channel(rtwdev);
+
+	if (p2p_roc) {
+		rtw89_core_p2p_scan_no_cck(rtwdev, rtwvif, true);
+		rtw89_btc_ntfy_scan_start(rtwdev, RTW89_PHY_0,
+					   rtw89_nl80211_to_hw_band(roc->chan.band));
+		rtw89_chip_rfk_scan(rtwdev, true);
+		rtw89_hci_recalc_int_mit(rtwdev);
+		rtw89_phy_config_edcca(rtwdev, true);
+	}
+
 	rtw89_write32_clr(rtwdev,
 			  rtw89_mac_reg_by_idx(rtwdev, mac->rx_fltr, RTW89_MAC_0),
 			  B_AX_A_UC_CAM_MATCH | B_AX_A_BC_CAM_MATCH);
@@ -3084,9 +3117,17 @@ void rtw89_roc_end(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 	struct ieee80211_hw *hw = rtwdev->hw;
 	struct rtw89_roc *roc = &rtwvif->roc;
 	struct rtw89_vif *tmp;
+	bool p2p_roc;
 	int ret;
 
 	lockdep_assert_held(&rtwdev->mutex);
+
+	p2p_roc = rtwvif->wifi_role == RTW89_WIFI_ROLE_P2P_DEVICE;
+
+	rtw89_debug(rtwdev, RTW89_DBG_CHAN,
+		    "ROC end: role=%d p2p=%d sub=%d state=%d\n",
+		    rtwvif->wifi_role, p2p_roc, rtwvif->sub_entity_idx,
+		    roc->state);
 
 	ieee80211_remain_on_channel_expired(hw);
 
@@ -3099,6 +3140,14 @@ void rtw89_roc_end(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 			   rtwdev->hal.rx_fltr);
 
 	roc->state = RTW89_ROC_IDLE;
+
+	if (p2p_roc) {
+		rtw89_chip_rfk_scan(rtwdev, false);
+		rtw89_btc_ntfy_scan_finish(rtwdev, RTW89_PHY_0);
+		rtw89_phy_config_edcca(rtwdev, false);
+		rtw89_core_p2p_scan_no_cck(rtwdev, rtwvif, false);
+	}
+
 	rtw89_config_roc_chandef(rtwdev, rtwvif->sub_entity_idx, NULL);
 	rtw89_chanctx_proceed(rtwdev);
 	ret = rtw89_core_send_nullfunc(rtwdev, rtwvif, true, false);
@@ -4364,6 +4413,7 @@ void rtw89_core_stop(struct rtw89_dev *rtwdev)
 	cancel_work_sync(&btc->dhcp_notify_work);
 	cancel_work_sync(&btc->icmp_notify_work);
 	cancel_delayed_work_sync(&rtwdev->txq_reinvoke_work);
+	cancel_delayed_work_sync(&rtwdev->hw_scan_timeout_work);
 	cancel_delayed_work_sync(&rtwdev->track_work);
 	cancel_delayed_work_sync(&rtwdev->chanctx_work);
 	cancel_delayed_work_sync(&rtwdev->coex_act1_work);
@@ -4401,6 +4451,7 @@ int rtw89_core_init(struct rtw89_dev *rtwdev)
 	INIT_WORK(&rtwdev->ba_work, rtw89_core_ba_work);
 	INIT_WORK(&rtwdev->txq_work, rtw89_core_txq_work);
 	INIT_DELAYED_WORK(&rtwdev->txq_reinvoke_work, rtw89_core_txq_reinvoke_work);
+	INIT_DELAYED_WORK(&rtwdev->hw_scan_timeout_work, rtw89_hw_scan_timeout_work);
 	INIT_DELAYED_WORK(&rtwdev->track_work, rtw89_track_work);
 	INIT_DELAYED_WORK(&rtwdev->chanctx_work, rtw89_chanctx_work);
 	INIT_DELAYED_WORK(&rtwdev->coex_act1_work, rtw89_coex_act1_work);
@@ -4476,6 +4527,15 @@ static void rtw89_core_p2p_scan_no_cck(struct rtw89_dev *rtwdev,
 	case RTL8851B:
 		break;
 	default:
+		return;
+	}
+
+	/* Some WFD sinks reply to P2P probes using CCK rates on 2.4 GHz. */
+	if (rtw89_disable_p2p_no_cck) {
+		rtwdev->p2p_no_cck_scan = false;
+		if (enable)
+			rtw89_debug(rtwdev, RTW89_DBG_TXRX,
+				    "P2P scan keeps CCK enabled\n");
 		return;
 	}
 
@@ -4869,6 +4929,7 @@ struct rtw89_dev *rtw89_alloc_ieee80211_hw(struct device *device,
 	struct ieee80211_ops *ops;
 	u32 driver_data_size;
 	int fw_format = -1;
+	bool has_chanctx_fw;
 	bool no_chanctx;
 
 	firmware = rtw89_early_fw_feature_recognize(device, chip, &early_fw, &fw_format);
@@ -4878,9 +4939,15 @@ struct rtw89_dev *rtw89_alloc_ieee80211_hw(struct device *device,
 		goto err;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
-	no_chanctx = chip->support_chanctx_num == 0 ||
-		     !RTW89_CHK_FW_FEATURE(SCAN_OFFLOAD, &early_fw) ||
-		     !RTW89_CHK_FW_FEATURE(BEACON_FILTER, &early_fw);
+	has_chanctx_fw = RTW89_CHK_FW_FEATURE(SCAN_OFFLOAD, &early_fw) &&
+			 RTW89_CHK_FW_FEATURE(BEACON_FILTER, &early_fw);
+	if (!has_chanctx_fw &&
+	    chip->chip_id == RTL8852B &&
+	    rtw89_force_8852b_chanctx &&
+	    RTW89_CHK_FW_FEATURE(SCAN_OFFLOAD, &early_fw))
+		has_chanctx_fw = true;
+
+	no_chanctx = chip->support_chanctx_num == 0 || !has_chanctx_fw;
 
 	if (no_chanctx) {
 		ops->add_chanctx = ieee80211_emulate_add_chanctx;
@@ -4889,6 +4956,13 @@ struct rtw89_dev *rtw89_alloc_ieee80211_hw(struct device *device,
 		ops->switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx;
 		ops->assign_vif_chanctx = NULL;
 		ops->unassign_vif_chanctx = NULL;
+		ops->remain_on_channel = NULL;
+		ops->cancel_remain_on_channel = NULL;
+	}
+
+	if (!no_chanctx &&
+	    chip->chip_id == RTL8852B &&
+	    rtw89_disable_8852b_roc) {
 		ops->remain_on_channel = NULL;
 		ops->cancel_remain_on_channel = NULL;
 	}
